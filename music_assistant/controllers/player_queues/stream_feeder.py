@@ -101,6 +101,13 @@ class StreamFeederMixin(_PlayerQueuesBase):
                         prepared_item.name,
                         holder.name,
                     )
+                    # EXPERIMENT feed-ahead: let the source line the next item up itself
+                    if (
+                        (hint := getattr(holder, "hint_next_item", None)) is not None
+                        and streamed_item.streamdetails is not None
+                        and prepared_item.streamdetails is not None
+                    ):
+                        await hint(streamed_item.streamdetails, prepared_item.streamdetails)
                     return
                 self.logger.debug(
                     "Preparing audio buffer for next track %s on queue %s",

@@ -1029,6 +1029,18 @@ class SpotifyProvider(MusicProvider):
             can_seek=True,
         )
 
+    async def hint_next_item(self, playing: StreamDetails, upcoming: StreamDetails) -> None:
+        """
+        Tell the backend which item follows the one being streamed (EXPERIMENT feed-ahead).
+
+        :param playing: Stream details of the item being streamed.
+        :param upcoming: Stream details of the item that follows it.
+        """
+        if (feed := getattr(self.backend, "feed_next", None)) is None:
+            return
+        media_type = "episode" if upcoming.media_type == MediaType.PODCAST_EPISODE else "track"
+        await feed(playing.uri, f"spotify:{media_type}:{upcoming.item_id}")
+
     async def get_audio_stream(
         self, streamdetails: StreamDetails, seek_position: int = 0
     ) -> AsyncGenerator[bytes]:
