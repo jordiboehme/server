@@ -15,9 +15,13 @@ capture) is owned by the Spotify Connect provider / core helpers and reused here
 
 from __future__ import annotations
 
+import array
 import asyncio
+import fcntl
 import os
 import shutil
+import termios
+import time
 from contextlib import suppress
 from functools import partial
 from pathlib import Path
@@ -666,6 +670,16 @@ class _SingleTrackRun:
         self._delivered = 0
         self._read_bytes = 0
         self._tail_zeros = 0
+        # probe: startup stage stamps and byte accounting for the boundary measurement
+        self._t_spawn: float | None = None
+        self._t_ready: float | None = None
+        self._t_login: float | None = None
+        self._t_playing: float | None = None
+        self._t_first_audio: float | None = None
+        self._t_last_read: float | None = None
+        self._raw_read = 0
+        self._scrubbed = 0
+        self._shaper: _CaptureShaper | None = None
 
     async def start(self) -> None:
         """Spawn the engine on this run's URI and get its audio flowing."""
@@ -698,6 +712,7 @@ class _SingleTrackRun:
             env=server.child_env(sink.sink_name),
         )
         await proc.start()
+        self._t_spawn = time.monotonic()
         # kept out of _tasks so stop() does not cancel it before the daemon has
         # exited, but a reader that dies still has to fail the run: nothing
         # else drains stdout and the daemon would block on a full pipe
@@ -856,6 +871,7 @@ class _SingleTrackRun:
         early - a skip, a seek or the account playing elsewhere - so a partial
         delivery is only a failure when the engine itself did not end cleanly.
         """
+        self._log_boundary("delivery end")
         if self._stopped or self._duration_ms is None:
             return
         proc = self._proc
@@ -1044,6 +1060,7 @@ class _SingleTrackRun:
         """
         await proc.wait()
         self._engine_exited = True
+        self._log_boundary(f"engine exit {proc.returncode}")
 
     async def _read_capture(self) -> None:
         """
@@ -1060,7 +1077,7 @@ class _SingleTrackRun:
         assert reader is not None
         assert proc is not None
         loop = asyncio.get_running_loop()
-        shaper = _CaptureShaper()
+        self._shaper = shaper = _CaptureShaper()
         pace_anchor: float | None = None
         paced_bytes = 0
         stalled_for = 0.0
@@ -1095,8 +1112,13 @@ class _SingleTrackRun:
                 # writer end closed: the capture sink is gone (pulse restart)
                 self._fail("Spotify playback was interrupted")
                 return
+            self._raw_read += len(chunk)
+            self._t_last_read = time.monotonic()
             if not (chunk := shaper.shape(chunk)):
                 continue
+            if self._t_first_audio is None:
+                self._t_first_audio = time.monotonic()
+                self._log_startup_timing()
             if pace_anchor is None:
                 pace_anchor = loop.time()
                 paced_bytes = 0
@@ -1128,6 +1150,7 @@ class _SingleTrackRun:
             if target > zone and self._read_bytes >= target - zone:
                 self._tail_zeros += len(chunk)
                 if self._tail_zeros > int(_TAIL_PAD_GRACE_S * _BYTES_PER_SECOND):
+                    self._scrubbed += len(chunk)
                     return b""
         else:
             self._tail_zeros = 0
@@ -1193,6 +1216,7 @@ class _SingleTrackRun:
             client_ready.set()
             return
         client_ready.set()
+        self._t_ready = time.monotonic()
         while not self._stopped:
             try:
                 await client.listen_events(self._handle_event)
@@ -1211,6 +1235,8 @@ class _SingleTrackRun:
         data = event.data
         if isinstance(data, SoloistAuthState):
             self._logged_in = data.logged_in
+            if data.logged_in and self._t_login is None:
+                self._t_login = time.monotonic()
             if data.logged_in is False and not self._unpaired:
                 await self._check_pairing_lost()
             return
@@ -1258,6 +1284,7 @@ class _SingleTrackRun:
             # before a finished single-track run exits: this run's item is over,
             # and what renders now is not its audio. The daemon is put down
             # rather than left to play to nobody on the account's one stream.
+            self._log_boundary(f"wander to {uri}")
             self._item_over = True
             self.logger.debug("Engine wandered to %s; %s has ended", uri, self.spotify_uri)
             self._finish_delivery()
@@ -1265,6 +1292,8 @@ class _SingleTrackRun:
             return
         if duration_ms:
             self._duration_ms = duration_ms
+        if self._t_playing is None:
+            self._t_playing = time.monotonic()
         self._started.set()
 
     def _observe_device_active(self, *, active: bool) -> None:
@@ -1320,6 +1349,60 @@ class _SingleTrackRun:
             and position_ms >= self._seek_target_ms - _SEEK_CONFIRM_GRACE_MS
         ):
             self._seek_confirmed.set()
+
+    def _log_startup_timing(self) -> None:
+        """Probe: log how long each startup stage of this run took, measured from the spawn."""
+        now = time.monotonic()
+        spawn = self._t_spawn if self._t_spawn is not None else now
+
+        def since(stamp: float | None) -> str:
+            return f"{stamp - spawn:.2f}s" if stamp is not None else "n/a"
+
+        trimmed_ms = (self._shaper._lead_skipped if self._shaper else 0) * 1000 / _BYTES_PER_SECOND
+        self.logger.debug(
+            "[probe] %s startup after spawn: endpoint %s, login %s, playing %s, "
+            "first audio %s (lead trim %d ms, seek %d ms)",
+            self.spotify_uri,
+            since(self._t_ready),
+            since(self._t_login),
+            since(self._t_playing),
+            since(now),
+            trimmed_ms,
+            self._seek_target_ms,
+        )
+
+    def _log_boundary(self, reason: str) -> None:
+        """Probe: log where this run's bytes stand at a boundary signal, never raising."""
+        try:
+            now = time.monotonic()
+            bps = _BYTES_PER_SECOND
+            lead = self._shaper._lead_skipped if self._shaper is not None else 0
+            reader_buf = (
+                len(getattr(self._reader, "_buffer", b"")) if self._reader is not None else -1
+            )
+            catalog_ms = (
+                self._duration_ms - self._seek_target_ms if self._duration_ms is not None else -1
+            )
+            last_read = now - self._t_last_read if self._t_last_read is not None else -1.0
+            self.logger.debug(
+                "[probe] %s boundary (%s): raw read %.3fs, audio %.3fs, lead trim %.3fs, "
+                "tail zeros %.3fs, unread fifo %.3fs, reader buffer %.3fs, catalog %.3fs, "
+                "delivered %.3fs, last read %.3fs ago, engine position %s ms",
+                self.spotify_uri,
+                reason,
+                self._raw_read / bps,
+                self._read_bytes / bps,
+                lead / bps,
+                self._scrubbed / bps,
+                _unread_pipe_bytes(self._transport) / bps,
+                reader_buf / bps,
+                catalog_ms / 1000,
+                self._delivered / bps,
+                last_read,
+                self._position_ms,
+            )
+        except Exception as err:
+            self.logger.debug("[probe] boundary log failed: %s", err)
 
 
 def proc_running(proc: AsyncProcess | None) -> bool:
@@ -1380,6 +1463,19 @@ class _CaptureShaper:
             return chunk[:-remainder]
         self._carry = b""
         return chunk
+
+
+def _unread_pipe_bytes(transport: asyncio.ReadTransport | None) -> int:
+    """Probe: return how many bytes sit unread in the FIFO behind the transport (-1 if unknown)."""
+    pipe = transport.get_extra_info("pipe") if transport is not None else None
+    if pipe is None:
+        return -1
+    try:
+        buf = array.array("i", [0])
+        fcntl.ioctl(pipe.fileno(), termios.FIONREAD, buf, True)
+        return int(buf[0])
+    except OSError, ValueError:
+        return -1
 
 
 async def _cancel_and_join(tasks: list[asyncio.Task[None]]) -> None:
