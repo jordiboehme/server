@@ -587,9 +587,9 @@ class SoloistBackend(SpotifyPlaybackBackend):
             # mean normalizing twice, or not at all
             raise AudioError("Spotify Soloist audio settings could not be applied")
 
-    def _session_args(self) -> list[str]:
+    def _session_args(self, spotify_uri: str) -> list[str]:
         """
-        Build the argv for one engine run (EXPERIMENT: ordinary mode, fed one ahead).
+        Build the argv for one engine run (EXPERIMENT: single-track mode, fed one ahead).
 
         SECURITY: the argv carries the user's API key — it must never be logged
         or end up in any error message.
@@ -597,6 +597,11 @@ class SoloistBackend(SpotifyPlaybackBackend):
         assert self._binary is not None
         return [
             str(self._binary),
+            # play exactly this item and exit when it finishes: the stored
+            # session is restored without advertising a Spotify Connect device,
+            # and shuffle/repeat start disabled
+            "--single-track",
+            spotify_uri,
             "--device-name",
             SOLOIST_DEVICE_NAME,
             "--api-key",
@@ -811,7 +816,7 @@ class _SingleTrackRun:
         await sink.set_volume(100)
         await sink.suspend()
         self._proc = proc = AsyncProcess(
-            backend._session_args(),
+            backend._session_args(self._item.spotify_uri),
             # the daemon writes all of its logging to stdout and only ever puts
             # argument-parsing complaints on stderr, so the two are merged into
             # one captured stream. Capturing is what makes the redaction below
@@ -849,14 +854,8 @@ class _SingleTrackRun:
             self._raise_startup_error("could not connect and sign in")
         if self._error or not client.connected:
             self._raise_startup_error("did not start up correctly")
-        # ordinary mode: claim the device, then play the item (a bare play would
-        # start local playback without a Connect transfer)
-        try:
-            await client.activate(await_result=True)
-        except Exception as err:
-            self._raise_startup_error(f"could not claim the device ({type(err).__name__} {err})")
+        # single-track mode: the engine plays the item by itself
         self._play_sent = True
-        await client.play(self._item.spotify_uri)
         await self._await_playback_started(proc)
         if self._item.seek_target_ms:
             await self._cold_seek(client, self._item.seek_target_ms)
